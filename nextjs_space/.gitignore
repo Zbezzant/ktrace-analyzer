@@ -1,0 +1,20 @@
+# dependencies
+/node_modules
+/.yarn
+.pnp.*
+
+# next.js / build output
+/.next
+/.build
+/out
+next-env.d.ts
+tsconfig.tsbuildinfo
+
+# python
+__pycache__/
+*.pyc
+
+# misc
+.DS_Store
+*.log
+.env*.local

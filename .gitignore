@@ -1,0 +1,14 @@
+# build & deps (under nextjs_space)
+nextjs_space/node_modules/
+nextjs_space/.yarn/
+nextjs_space/.next/
+nextjs_space/.build/
+nextjs_space/out/
+nextjs_space/tsconfig.tsbuildinfo
+# python
+**/__pycache__/
+*.pyc
+# os / docs artifacts
+.DS_Store
+*.pdf
+*.docx
