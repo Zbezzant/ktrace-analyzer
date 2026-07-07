@@ -1,10 +1,11 @@
 'use client';
 
 import { motion } from 'framer-motion';
-import { BarChart3, PhoneOff, Clock } from 'lucide-react';
+import { BarChart3, PhoneOff, Clock, Timer } from 'lucide-react';
 import { SubTabs } from '@/components/sub-tabs';
 import { CallEndAnalysis } from '@/components/call-end-analysis';
 import { TimingAnalysis } from '@/components/timing-analysis';
+import { DelayAnalysis } from '@/components/delay-analysis';
 
 export function KtraceAnalyzer() {
   return (
@@ -41,6 +42,7 @@ export function KtraceAnalyzer() {
           tabs={[
             { key: 'call-end', label: 'Call End Analysis', icon: <PhoneOff className="w-4 h-4" /> },
             { key: 'timing', label: 'Timing Analysis', icon: <Clock className="w-4 h-4" /> },
+            { key: 'delay', label: 'Response Delay', icon: <Timer className="w-4 h-4" /> },
           ]}
           defaultTab="call-end"
         >
@@ -48,6 +50,7 @@ export function KtraceAnalyzer() {
             <>
               {activeTab === 'call-end' && <CallEndAnalysis />}
               {activeTab === 'timing' && <TimingAnalysis />}
+              {activeTab === 'delay' && <DelayAnalysis />}
             </>
           )}
         </SubTabs>

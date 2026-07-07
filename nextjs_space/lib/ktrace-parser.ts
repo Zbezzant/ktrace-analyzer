@@ -25,6 +25,278 @@ export interface ParseResult {
   totalProtocallStop: number;
   totalCalls: number;
   fileName: string;
+  delay: DelayAnalysis;
+}
+
+/* =============================================================================
+ * AGENT RESPONSE DELAY
+ * -----------------------------------------------------------------------------
+ * Measures how quickly a human agent reacts after the customer STOPS speaking:
+ *   delay = (agent's next key press ts) - (customer SPEECH_STOPPED ts)
+ *
+ * Only supported on VAD logs (those containing SPEECH_STOPPED). STT-only logs
+ * are flagged unsupported (hasSpeechStopped=false) and excluded from all math.
+ *
+ * Thresholds (ceiling/floor) are applied LATE in the UI, never baked into raw
+ * samples — the parser only applies the always-on "resume-speech" filter.
+ * =========================================================================== */
+
+export interface DelayConfig {
+  ceilingMs: number; // drop delays above this (deliberation)
+  floorMs: number;   // drop delays below this (anticipation)
+}
+
+export const DEFAULT_DELAY_CONFIG: DelayConfig = { ceilingMs: 1200, floorMs: 150 };
+
+export interface DelaySample {
+  delta: number;          // ms = agentActionTs - speechStoppedTs
+  page: string;           // page active when the agent acted
+  key: string;            // literal key pressed, e.g. "5", "DOWN"
+  action: string | null;  // enriched action name (from KEYBOARD line)
+  hotkey: string | null;  // enriched hotkey (from KEYBOARD line)
+  timestamp: string;      // "HH:MM:SS.mmm" of the agent action
+}
+
+export interface DelayAnalysis {
+  agent: string;
+  hasSpeechStopped: boolean;   // false => unsupported (no VAD), excluded
+  rawSamples: DelaySample[];   // resume-filtered, NO ceiling/floor applied
+  nStops: number;
+  nStarts: number;
+  nActions: number;
+  droppedResume: number;       // pairs discarded because customer resumed speaking
+}
+
+export interface DelayStat {
+  count: number;
+  mean: number;
+  median: number;
+  min: number;
+  max: number;
+  std: number;
+  p25: number;
+  p75: number;
+}
+
+/** Derive the agent id from the filename: token between "KTRACE_PC_" and next "_". */
+export function agentFromFileName(fileName: string | null | undefined): string {
+  const m = (fileName ?? '').match(/KTRACE_PC_([^_]+)_/);
+  return m?.[1] ?? (fileName ?? 'unknown');
+}
+
+/** Parse "HH:MM:SS.mmm" -> ms since midnight; null if not a valid timestamp. */
+function timeToMs(tsStr: string): number | null {
+  const m = (tsStr ?? '').match(/^(\d{1,2}):(\d{2}):(\d{2})\.(\d{3})$/);
+  if (!m) return null;
+  const h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  const s = parseInt(m[3], 10);
+  const ms = parseInt(m[4], 10);
+  return ((h * 60 + min) * 60 + s) * 1000 + ms;
+}
+
+/** Largest index in sorted[] whose value is strictly < target (or -1). */
+function lastIndexBefore(sorted: number[], target: number): number {
+  let lo = 0, hi = sorted.length - 1, res = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (sorted[mid] < target) { res = mid; lo = mid + 1; }
+    else { hi = mid - 1; }
+  }
+  return res;
+}
+
+/** Smallest index in sorted[] whose value is strictly > target (or length). */
+function firstIndexAfter(sorted: number[], target: number): number {
+  let lo = 0, hi = sorted.length - 1, res = sorted.length;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (sorted[mid] > target) { res = mid; hi = mid - 1; }
+    else { lo = mid + 1; }
+  }
+  return res;
+}
+
+const MS_12H = 12 * 60 * 60 * 1000;
+const MS_24H = 24 * 60 * 60 * 1000;
+
+/**
+ * Analyze agent response delays for a single file (= single agent).
+ * `lines` are the raw log lines (may include trailing "\r").
+ */
+export function analyzeDelays(lines: string[], fileName: string): DelayAnalysis {
+  const agent = agentFromFileName(fileName);
+
+  const tsLineRe = /^(\d{1,2}:\d{2}:\d{2}\.\d{3})\s+-\s+(.*)$/;
+  const keyPressRe = /Agent Key Press - "([^"]*)"/;
+  const goToRe = /AddActionToProcessTracker\(\) - GO To: "([^"]+)"/;
+  const wsPageRe = /"name":"([^"]+)","options":.*"type":"page"/;
+  const keyboardActionRe = /AddActionToProcessTracker\(\) - (?:Page|Global) ACTION: "([^"]*)" HotKey: "([^"]*)" \[.*\] triggered KEYBOARD/;
+  const SPEECH_STOPPED = 'OnReActiveAudioEvent( SPEECH_STOPPED )';
+  const SPEECH_STARTED = 'OnReActiveAudioEvent( SPEECH_STARTED )';
+
+  const stops: number[] = [];
+  const starts: number[] = [];
+  // action tuple: [ms, key, action, hotkey, tsStr]
+  const actions: Array<[number, string, string | null, string | null, string]> = [];
+  const pageMarks: { ms: number; name: string }[] = [];
+
+  let prevMs: number | null = null;
+  let dayOffset = 0;
+
+  for (const raw of (lines ?? [])) {
+    const line = (raw ?? '').replace(/\r$/, ''); // GOTCHA (a): strip trailing CR
+    const m = line.match(tsLineRe);
+    if (!m) continue;
+
+    const tsStr = m[1];
+    const rest = m[2] ?? '';
+    let ts = timeToMs(tsStr);
+    if (ts == null) continue;
+
+    // GOTCHA (b): midnight rollover
+    if (prevMs != null && ts + MS_12H < prevMs) {
+      dayOffset += MS_24H;
+    }
+    ts += dayOffset;
+    prevMs = ts;
+
+    if (rest.includes(SPEECH_STOPPED)) {
+      stops.push(ts);
+    } else if (rest.includes(SPEECH_STARTED)) {
+      starts.push(ts);
+    } else if (rest.includes('Agent Key Press')) {
+      const km = rest.match(keyPressRe);
+      const key = km?.[1] ?? '';
+      if (key !== '') {
+        actions.push([ts, key, null, null, tsStr]);
+      }
+    } else if (rest.includes('GO To:')) {
+      const gm = rest.match(goToRe);
+      if (gm) pageMarks.push({ ms: ts, name: gm[1] });
+    } else if (rest.includes('"type":"page"')) {
+      const wm = rest.match(wsPageRe);
+      if (wm) pageMarks.push({ ms: ts, name: wm[1] });
+    } else if (rest.includes('triggered KEYBOARD')) {
+      const am = rest.match(keyboardActionRe);
+      if (am) {
+        const name = am[1] ?? '';
+        const hotkey = am[2] ?? '';
+        // Enrich the most recent action whose action-name is still null,
+        // if it occurred within 300ms before this line.
+        for (let idx = actions.length - 1; idx >= 0; idx--) {
+          const a = actions[idx];
+          if (a[2] === null) {
+            if (ts - a[0] <= 300 && ts - a[0] >= 0) {
+              a[2] = name;
+              a[3] = hotkey;
+            }
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  const nStops = stops.length;
+  const nStarts = starts.length;
+  const nActions = actions.length;
+
+  if (nStops === 0) {
+    return {
+      agent,
+      hasSpeechStopped: false,
+      rawSamples: [],
+      nStops,
+      nStarts,
+      nActions,
+      droppedResume: 0,
+    };
+  }
+
+  // Pass 2 — build samples
+  const sortedStops = [...stops].sort((a, b) => a - b);
+  const sortedStarts = [...starts].sort((a, b) => a - b);
+  const sortedPages = [...pageMarks].sort((a, b) => a.ms - b.ms);
+  const pageMs = sortedPages.map((p) => p.ms);
+
+  function pageAt(ts: number): string {
+    const j = lastIndexBefore(pageMs, ts + 1); // last pageMark with ms <= ts
+    if (j < 0) return '(unknown)';
+    return sortedPages[j]?.name ?? '(unknown)';
+  }
+
+  const rawSamples: DelaySample[] = [];
+  let droppedResume = 0;
+
+  for (const [ts, key, action, hotkey, tsStr] of actions) {
+    const j = lastIndexBefore(sortedStops, ts + 1); // nearest SPEECH_STOPPED <= ts
+    if (j < 0) continue;
+    const delta = ts - sortedStops[j];
+    if (delta < 0) continue;
+
+    // RESUME FILTER (always on): if the customer started speaking again after
+    // this SPEECH_STOPPED but before the agent acted, discard the pair.
+    const k = firstIndexAfter(sortedStarts, sortedStops[j]);
+    if (k < sortedStarts.length && sortedStarts[k] < ts) {
+      droppedResume++;
+      continue;
+    }
+
+    rawSamples.push({
+      delta,
+      page: pageAt(ts),
+      key,
+      action,
+      hotkey,
+      timestamp: tsStr,
+    });
+  }
+
+  return {
+    agent,
+    hasSpeechStopped: true,
+    rawSamples,
+    nStops,
+    nStarts,
+    nActions,
+    droppedResume,
+  };
+}
+
+/** Summarize a list of deltas (ms) into count/mean/median/min/max/std/p25/p75. */
+export function summarizeDeltas(deltas: number[]): DelayStat | null {
+  const n = deltas?.length ?? 0;
+  if (n === 0) return null;
+  const ds = [...deltas].sort((a, b) => a - b);
+
+  const sum = ds.reduce((s, d) => s + d, 0);
+  const mean = sum / n;
+  const median = n % 2 === 1 ? ds[(n - 1) / 2] : (ds[n / 2 - 1] + ds[n / 2]) / 2;
+  const variance = ds.reduce((s, d) => s + (d - mean) * (d - mean), 0) / n;
+  const std = Math.sqrt(variance);
+  const pct = (p: number) => {
+    const idx = Math.min(Math.max(Math.round(p * (n - 1)), 0), n - 1);
+    return ds[idx];
+  };
+
+  return {
+    count: n,
+    mean: Math.round(mean),
+    median: Math.round(median),
+    min: Math.round(ds[0]),
+    max: Math.round(ds[n - 1]),
+    std: Math.round(std),
+    p25: Math.round(pct(0.25)),
+    p75: Math.round(pct(0.75)),
+  };
+}
+
+/** Apply ceiling/floor thresholds to a delay analysis, returning kept deltas. */
+export function filteredDeltas(analysis: DelayAnalysis | null | undefined, cfg: DelayConfig): number[] {
+  return (analysis?.rawSamples ?? [])
+    .map((s) => s.delta)
+    .filter((d) => d >= cfg.floorMs && d <= cfg.ceilingMs);
 }
 
 /**
@@ -294,6 +566,7 @@ export function parseKtraceLog(content: string, fileName: string): ParseResult {
     totalProtocallStop,
     totalCalls: totalPlusKey + totalProtocallStop,
     fileName,
+    delay: analyzeDelays(lines, fileName),
   };
 }
 
