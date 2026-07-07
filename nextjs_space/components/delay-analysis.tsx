@@ -56,11 +56,17 @@ interface AgentRow {
   stat: DelayStat | null;
 }
 
-interface KeyRow {
+interface KeyAgentRow {
   agent: string;
+  stat: DelayStat;
+}
+
+interface KeySection {
   key: string;
   label: string;
-  stat: DelayStat;
+  agentRows: KeyAgentRow[];
+  totalSamples: number;
+  overallMedian: number;
 }
 
 interface PageSection {
@@ -68,7 +74,7 @@ interface PageSection {
   rows: { agent: string; stat: DelayStat }[];
   total: number;
   pageMedian: number;
-  keyRows: KeyRow[];
+  keySections: KeySection[];
 }
 
 type KeyAgg = { deltas: number[]; action: string | null; hotkey: string | null };
@@ -166,11 +172,11 @@ export function DelayAnalysis({ results: externalResults }: DelayAnalysisProps) 
     [agentRows],
   );
 
-  // (D) Per-page agent comparison + (7) per-key breakdown
+  // (D) Per-page agent comparison + (7) per-key breakdown (grouped by key)
   const pageSections: PageSection[] = useMemo(() => {
     // page -> agent -> deltas
     const pageAgent = new Map<string, Map<string, number[]>>();
-    // page -> agent -> key -> KeyAgg
+    // page -> key -> agent -> KeyAgg
     const keyMap = new Map<string, Map<string, Map<string, KeyAgg>>>();
 
     for (const f of perFile) {
@@ -181,13 +187,14 @@ export function DelayAnalysis({ results: externalResults }: DelayAnalysisProps) 
         if (!am.has(f.agent)) am.set(f.agent, []);
         am.get(f.agent)!.push(s.delta);
 
-        // page -> agent -> key -> KeyAgg
+        // page -> key -> agent -> KeyAgg (restructured to group by key first)
         if (!keyMap.has(s.page)) keyMap.set(s.page, new Map());
-        const kagents = keyMap.get(s.page)!;
-        if (!kagents.has(f.agent)) kagents.set(f.agent, new Map());
-        const keys = kagents.get(f.agent)!;
-        if (!keys.has(s.key)) keys.set(s.key, { deltas: [], action: null, hotkey: null });
-        const agg = keys.get(s.key)!;
+        const pageKeys = keyMap.get(s.page)!;
+        if (!pageKeys.has(s.key)) pageKeys.set(s.key, new Map());
+        const keyAgents = pageKeys.get(s.key)!;
+        if (!keyAgents.has(f.agent))
+          keyAgents.set(f.agent, { deltas: [], action: null, hotkey: null });
+        const agg = keyAgents.get(f.agent)!;
         agg.deltas.push(s.delta);
         if (!agg.action && s.action) agg.action = s.action;
         if (!agg.hotkey && s.hotkey) agg.hotkey = s.hotkey;
@@ -205,23 +212,40 @@ export function DelayAnalysis({ results: externalResults }: DelayAnalysisProps) 
       const total = allDeltas.length;
       const pageMedian = summarizeDeltas(allDeltas)?.median ?? 0;
 
-      // per-key rows, in ranked-agent order
-      const keyRows: KeyRow[] = [];
-      for (const r of rows) {
-        const keys = keyMap.get(page)?.get(r.agent);
-        if (!keys) continue;
-        const kr = Array.from(keys.entries())
-          .map(([key, info]) => ({
-            agent: r.agent,
-            key,
-            label: info.action || info.hotkey || '',
-            stat: summarizeDeltas(info.deltas)!,
-          }))
-          .sort((a, b) => b.stat.count - a.stat.count || a.stat.median - b.stat.median);
-        keyRows.push(...kr);
+      // Build per-key sections (grouped by key, with agents sorted fastest-first within each key)
+      const keySections: KeySection[] = [];
+      const pageKeys = keyMap.get(page);
+      if (pageKeys) {
+        for (const [key, keyAgents] of pageKeys.entries()) {
+          const agentRows: KeyAgentRow[] = [];
+          let label = '';
+          const allKeyDeltas: number[] = [];
+
+          for (const [agent, agg] of keyAgents.entries()) {
+            const stat = summarizeDeltas(agg.deltas);
+            if (stat) {
+              agentRows.push({ agent, stat });
+              allKeyDeltas.push(...agg.deltas);
+              if (!label && (agg.action || agg.hotkey)) {
+                label = agg.action || agg.hotkey || '';
+              }
+            }
+          }
+
+          // Sort agents within this key by median (fastest first)
+          agentRows.sort((a, b) => a.stat.median - b.stat.median);
+
+          const totalSamples = allKeyDeltas.length;
+          const overallMedian = summarizeDeltas(allKeyDeltas)?.median ?? 0;
+
+          keySections.push({ key, label, agentRows, totalSamples, overallMedian });
+        }
       }
 
-      sections.push({ page, rows, total, pageMedian, keyRows });
+      // Sort keys by total sample count (most used first)
+      keySections.sort((a, b) => b.totalSamples - a.totalSamples);
+
+      sections.push({ page, rows, total, pageMedian, keySections });
     }
 
     return sections.sort((a, b) => b.total - a.total);
@@ -555,14 +579,14 @@ export function DelayAnalysis({ results: externalResults }: DelayAnalysisProps) 
                     </div>
 
                     {/* Per-key breakdown (collapsible) */}
-                    {section.keyRows.length > 0 && (
+                    {section.keySections.length > 0 && (
                       <div className="mt-3 pt-3 border-t border-border/60">
                         <button
                           onClick={() => togglePage(section.page)}
                           className="flex items-center gap-1.5 text-xs font-medium text-primary hover:opacity-80 transition-opacity"
                         >
                           <KeyRound className="w-3.5 h-3.5" />
-                          {isExpanded ? 'Hide' : 'Show'} per-key breakdown ({section.keyRows.length} keys)
+                          {isExpanded ? 'Hide' : 'Show'} per-key breakdown ({section.keySections.length} keys)
                           <ChevronDown
                             className={`w-3.5 h-3.5 transition-transform ${isExpanded ? 'rotate-180' : ''}`}
                           />
@@ -575,50 +599,80 @@ export function DelayAnalysis({ results: externalResults }: DelayAnalysisProps) 
                               exit={{ opacity: 0, height: 0 }}
                               className="overflow-hidden"
                             >
-                              <div className="overflow-x-auto mt-3">
-                                <table className="w-full text-xs">
-                                  <thead>
-                                    <tr className="text-left text-muted-foreground border-b border-border">
-                                      <th className="py-1.5 pr-3 font-medium">Agent</th>
-                                      <th className="py-1.5 pr-3 font-medium">Key</th>
-                                      <th className="py-1.5 pr-3 font-medium">Action</th>
-                                      <th className="py-1.5 pr-3 font-medium text-right">N</th>
-                                      <th className="py-1.5 pr-3 font-medium text-right">Median</th>
-                                      <th className="py-1.5 pr-3 font-medium text-right">Mean</th>
-                                      <th className="py-1.5 pr-3 font-medium text-right">Min</th>
-                                      <th className="py-1.5 pr-3 font-medium text-right">Max</th>
-                                      <th className="py-1.5 pr-3 font-medium text-right">IQR</th>
-                                    </tr>
-                                  </thead>
-                                  <tbody>
-                                    {section.keyRows.map((kr, i) => (
-                                      <tr
-                                        key={`${kr.agent}-${kr.key}-${i}`}
-                                        className="border-b border-border/40 last:border-0"
-                                      >
-                                        <td className="py-1.5 pr-3 text-muted-foreground">{kr.agent}</td>
-                                        <td className="py-1.5 pr-3">
-                                          <code className="text-[11px] bg-muted px-1.5 py-0.5 rounded text-foreground">
-                                            {kr.key}
-                                          </code>
-                                        </td>
-                                        <td className="py-1.5 pr-3 text-muted-foreground">
-                                          {kr.label || <span className="italic opacity-60">—</span>}
-                                        </td>
-                                        <td className="py-1.5 pr-3 text-right tabular-nums text-muted-foreground">{kr.stat.count}</td>
-                                        <td className={`py-1.5 pr-3 text-right tabular-nums font-semibold ${speedColor(kr.stat.median)}`}>
-                                          {kr.stat.median}ms
-                                        </td>
-                                        <td className="py-1.5 pr-3 text-right tabular-nums text-muted-foreground">{kr.stat.mean}ms</td>
-                                        <td className="py-1.5 pr-3 text-right tabular-nums text-muted-foreground">{kr.stat.min}ms</td>
-                                        <td className="py-1.5 pr-3 text-right tabular-nums text-muted-foreground">{kr.stat.max}ms</td>
-                                        <td className="py-1.5 pr-3 text-right tabular-nums text-muted-foreground">
-                                          {kr.stat.p25}–{kr.stat.p75}
-                                        </td>
-                                      </tr>
-                                    ))}
-                                  </tbody>
-                                </table>
+                              <div className="space-y-4 mt-4">
+                                {section.keySections.map((ks) => (
+                                  <div
+                                    key={ks.key}
+                                    className="bg-muted/30 rounded-[var(--radius)] p-3 border border-border/50"
+                                  >
+                                    <div className="flex items-center gap-3 mb-2">
+                                      <code className="text-sm bg-background px-2 py-1 rounded text-foreground font-mono font-semibold">
+                                        {ks.key}
+                                      </code>
+                                      {ks.label && (
+                                        <span className="text-xs text-muted-foreground">
+                                          {ks.label}
+                                        </span>
+                                      )}
+                                      <span className="text-xs text-muted-foreground ml-auto">
+                                        {ks.totalSamples} samples • {ks.overallMedian}ms median
+                                      </span>
+                                    </div>
+                                    <div className="overflow-x-auto">
+                                      <table className="w-full text-xs">
+                                        <thead>
+                                          <tr className="text-left text-muted-foreground border-b border-border/50">
+                                            <th className="py-1.5 pr-3 font-medium">#</th>
+                                            <th className="py-1.5 pr-3 font-medium">Agent</th>
+                                            <th className="py-1.5 pr-3 font-medium text-right">N</th>
+                                            <th className="py-1.5 pr-3 font-medium text-right">Median</th>
+                                            <th className="py-1.5 pr-3 font-medium text-right">Mean</th>
+                                            <th className="py-1.5 pr-3 font-medium text-right">Min</th>
+                                            <th className="py-1.5 pr-3 font-medium text-right">Max</th>
+                                            <th className="py-1.5 pr-3 font-medium text-right">IQR</th>
+                                          </tr>
+                                        </thead>
+                                        <tbody>
+                                          {ks.agentRows.map((ar, i) => (
+                                            <tr
+                                              key={`${ks.key}-${ar.agent}-${i}`}
+                                              className="border-b border-border/30 last:border-0"
+                                            >
+                                              <td className="py-1.5 pr-3 text-muted-foreground text-center">
+                                                {i === 0 && (
+                                                  <Trophy className="w-3 h-3 text-amber-500 inline" />
+                                                )}
+                                              </td>
+                                              <td className="py-1.5 pr-3 text-foreground font-medium">
+                                                {ar.agent}
+                                              </td>
+                                              <td className="py-1.5 pr-3 text-right tabular-nums text-muted-foreground">
+                                                {ar.stat.count}
+                                              </td>
+                                              <td
+                                                className={`py-1.5 pr-3 text-right tabular-nums font-semibold ${speedColor(ar.stat.median)}`}
+                                              >
+                                                {ar.stat.median}ms
+                                              </td>
+                                              <td className="py-1.5 pr-3 text-right tabular-nums text-muted-foreground">
+                                                {ar.stat.mean}ms
+                                              </td>
+                                              <td className="py-1.5 pr-3 text-right tabular-nums text-muted-foreground">
+                                                {ar.stat.min}ms
+                                              </td>
+                                              <td className="py-1.5 pr-3 text-right tabular-nums text-muted-foreground">
+                                                {ar.stat.max}ms
+                                              </td>
+                                              <td className="py-1.5 pr-3 text-right tabular-nums text-muted-foreground">
+                                                {ar.stat.p25}–{ar.stat.p75}
+                                              </td>
+                                            </tr>
+                                          ))}
+                                        </tbody>
+                                      </table>
+                                    </div>
+                                  </div>
+                                ))}
                               </div>
                             </motion.div>
                           )}
