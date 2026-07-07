@@ -5,6 +5,12 @@ nextjs_space/.next/
 nextjs_space/.build/
 nextjs_space/out/
 nextjs_space/tsconfig.tsbuildinfo
+# build & deps (root level)
+node_modules/
+.next/
+.build/
+tsconfig.tsbuildinfo
+out/
 # python
 **/__pycache__/
 *.pyc
@@ -12,3 +18,5 @@ nextjs_space/tsconfig.tsbuildinfo
 .DS_Store
 *.pdf
 *.docx
+# platform
+.abacus.donotdelete
