@@ -225,16 +225,16 @@ function _classifyJson(obj: any, ts: number, line: string): KEvent | null {
     };
   }
 
-  const objType = String(obj.type ?? '').toLowerCase();
+  const objType = String(obj.type ?? settings.type ?? '').toLowerCase();
 
   if (objType === 'page') {
     return {
       kind: EventKind.PAGE_NAV,
       ts,
       data: {
-        page_name: obj.name,
-        page_num: obj.page ?? obj.id,
-        trigger: obj.trigger,
+        page_name: obj.name ?? settings.name,
+        page_num: obj.page ?? obj.id ?? settings.page ?? settings.id,
+        trigger: obj.trigger ?? settings.trigger,
       },
       raw: line,
     };
@@ -250,13 +250,17 @@ function _classifyJson(obj: any, ts: number, line: string): KEvent | null {
     };
   }
 
-  const action = String(obj.action ?? '').toLowerCase();
+  const action = String(obj.action ?? settings.action ?? '').toLowerCase();
+  const msgObj = ('text' in obj || 'id' in obj) ? obj : (Object.keys(settings).length ? settings : obj);
   if (action === 'start' && ['dialog', 'message', 'voice', ''].includes(objType)) {
-    if ('text' in obj || ['dialog', 'message', 'voice'].includes(objType)) {
+    if ('text' in obj || 'text' in settings || ['dialog', 'message', 'voice'].includes(objType)) {
       return {
         kind: EventKind.MSG_START,
         ts,
-        data: { dialog_id: obj.id ?? obj.voice, msg_text: obj.text ?? '' },
+        data: {
+          dialog_id: msgObj.id ?? msgObj.voice ?? obj.id ?? obj.voice,
+          msg_text: obj.text ?? settings.text ?? '',
+        },
         raw: line,
       };
     }

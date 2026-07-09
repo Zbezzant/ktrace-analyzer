@@ -292,7 +292,7 @@ export function TimingAnalysis() {
         <p className="text-muted-foreground text-sm max-w-2xl">
           Extract the five human-derived timing attributes (Cached Action, Suggestion Filter,
           Ignore Interrupt, Speech Interrupt &amp; STT VAD Silence) used to configure the
-          conversational AI. Powered by <code className="font-mono text-xs">analyzer.py</code>.
+          conversational AI. Analysis runs natively in the browser.
         </p>
       </div>
 
