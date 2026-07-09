@@ -258,7 +258,14 @@ function _classifyJson(obj: any, ts: number, line: string): KEvent | null {
         kind: EventKind.MSG_START,
         ts,
         data: {
-          dialog_id: msgObj.id ?? msgObj.voice ?? obj.id ?? obj.voice,
+          dialog_id:
+            msgObj.dialog_id ??
+            obj.dialog_id ??
+            settings.dialog_id ??
+            msgObj.id ??
+            obj.id ??
+            msgObj.voice ??
+            obj.voice,
           msg_text: obj.text ?? settings.text ?? '',
         },
         raw: line,
@@ -384,8 +391,9 @@ class MessageInstance {
       t = t.split(/\s+/).join(' ');
       if (t) return t.length > 80 ? t.slice(0, 80) + '...' : t;
     }
-    if (this.msg_id !== null && this.msg_id !== undefined) return `Message #${this.msg_id}`;
-    return '(unnamed message)';
+    if (this.msg_id !== null && this.msg_id !== undefined && this.msg_id !== 0)
+      return `Message #${this.msg_id}`;
+    return '(no audio)';
   }
 }
 
@@ -473,6 +481,19 @@ class LogAnalyzer {
     const messages: MessageInstance[] = [];
     const pageArrivals: Array<[number, string]> = [];
 
+    // Build a dialog_id -> text map so empty-text instances of a known dialog
+    // can inherit the real message text seen on another instance in the log.
+    const dialogText = new Map<number, string>();
+    for (const e of this.events) {
+      if (e.kind === EventKind.MSG_START) {
+        const id = e.data.dialog_id;
+        const txt = (e.data.msg_text ?? '').trim();
+        if (id !== null && id !== undefined && id !== 0 && txt && !dialogText.has(id)) {
+          dialogText.set(id, e.data.msg_text);
+        }
+      }
+    }
+
     let curPage = '(unknown)';
     let curMsg: MessageInstance | null = null;
     let pageJustChangedTs: number | null = null;
@@ -491,11 +512,18 @@ class LogAnalyzer {
         }
         const isDefault =
           pageJustChangedTs !== null && e.ts - pageJustChangedTs <= 1500;
+        let msgText = e.data.msg_text ?? '';
+        if (!msgText.trim()) {
+          const did = e.data.dialog_id;
+          if (did !== null && did !== undefined && dialogText.has(did)) {
+            msgText = dialogText.get(did)!;
+          }
+        }
         curMsg = new MessageInstance(
           e.ts,
           curPage,
           e.data.dialog_id ?? null,
-          e.data.msg_text ?? '',
+          msgText,
           isDefault,
         );
         messages.push(curMsg);
