@@ -16,6 +16,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { FileUploader } from '@/components/file-uploader';
 import { toast } from 'sonner';
+import { contentHash } from '@/lib/utils';
 import type {
   TimingAnalysisResult,
   TimingAttribute,
@@ -200,16 +201,51 @@ function LevelSection({ level }: { level: TimingLevel }) {
   );
 }
 
+type UniqueFile = { name: string; content: string; hash: string };
+
 export function TimingAnalysis() {
   const [result, setResult] = useState<TimingAnalysisResult | null>(null);
+  const [uniqueFiles, setUniqueFiles] = useState<UniqueFile[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
 
   const handleUpload = useCallback(async (files: File[]) => {
     if (!files?.length) return;
     setIsProcessing(true);
     try {
+      // Read + hash every uploaded file, skipping content-identical duplicates
+      // (against already-accepted files and within the current batch).
+      const existingHashes = new Set(uniqueFiles.map((u) => u.hash));
+      const batchHashes = new Set<string>();
+      const accepted: UniqueFile[] = [];
+      let duplicateCount = 0;
+
+      for (const f of files) {
+        const content = await f.text();
+        const hash = contentHash(content);
+        if (existingHashes.has(hash) || batchHashes.has(hash)) {
+          duplicateCount += 1;
+          continue;
+        }
+        batchHashes.add(hash);
+        accepted.push({ name: f.name || 'log', content, hash });
+      }
+
+      if (accepted.length === 0) {
+        toast.info('Duplicate file(s) skipped', {
+          description:
+            duplicateCount > 0
+              ? `${duplicateCount} file(s) contained data identical to files already analyzed.`
+              : undefined,
+        });
+        return;
+      }
+
+      // Re-send the FULL unique set so per-level aggregation combines every file.
+      const combined = [...uniqueFiles, ...accepted];
       const fd = new FormData();
-      for (const f of files) fd.append('files', f);
+      for (const u of combined) {
+        fd.append('files', new Blob([u.content], { type: 'text/plain' }), u.name);
+      }
 
       const res = await fetch('/api/analyze', { method: 'POST', body: fd });
       const data: TimingAnalysisResult = await res.json();
@@ -218,19 +254,17 @@ export function TimingAnalysis() {
         throw new Error(data?.error || `Request failed (${res.status})`);
       }
 
-      setResult((prev) => {
-        // Merge newly analyzed files into existing results, re-running is per request,
-        // so we simply replace with the latest combined result for clarity.
-        if (!prev) return data;
-        return {
-          files: [...prev.files, ...(data.files ?? [])],
-          levels: data.levels, // latest batch's per-level aggregation
-        };
-      });
+      setUniqueFiles(combined);
+      setResult(data);
 
       const lvls = (data.files ?? []).map((f) => f.level).filter(Boolean);
-      toast.success(`Analyzed ${data.files?.length ?? 0} file(s)`, {
-        description: lvls.length ? `Detected level(s): ${Array.from(new Set(lvls)).join(', ')}` : undefined,
+      toast.success(`Analyzed ${accepted.length} new file(s)`, {
+        description: [
+          lvls.length ? `Detected level(s): ${Array.from(new Set(lvls)).join(', ')}` : null,
+          duplicateCount > 0 ? `${duplicateCount} duplicate(s) skipped` : null,
+        ]
+          .filter(Boolean)
+          .join(' · ') || undefined,
       });
     } catch (err: any) {
       console.error('Timing analysis error:', err);
@@ -238,10 +272,11 @@ export function TimingAnalysis() {
     } finally {
       setIsProcessing(false);
     }
-  }, []);
+  }, [uniqueFiles]);
 
   const handleClear = useCallback(() => {
     setResult(null);
+    setUniqueFiles([]);
     toast.info('Analysis cleared');
   }, []);
 

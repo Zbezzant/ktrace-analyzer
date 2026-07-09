@@ -43,24 +43,42 @@ export function CallEndAnalysis() {
     setIsProcessing(true);
     try {
       const newResults: ParseResult[] = [];
+      let duplicates = 0;
+      const existingHashes = new Set((results ?? []).map((r) => r.contentHash));
+      const batchHashes = new Set<string>();
       for (const file of (files ?? [])) {
         const content = await file?.text?.();
         if (content) {
           const result = parseKtraceLog(content, file?.name ?? 'unknown');
+          if (existingHashes.has(result.contentHash) || batchHashes.has(result.contentHash)) {
+            duplicates++;
+            continue;
+          }
+          batchHashes.add(result.contentHash);
           newResults.push(result);
         }
       }
-      setResults((prev: ParseResult[]) => [...(prev ?? []), ...newResults]);
-      toast.success(`Processed ${newResults?.length ?? 0} log file(s)`, {
-        description: `Found ${newResults.reduce((s: number, r: ParseResult) => s + (r?.totalCalls ?? 0), 0)} call end events`,
-      });
+      if (newResults.length > 0) {
+        setResults((prev: ParseResult[]) => [...(prev ?? []), ...newResults]);
+      }
+      if (newResults.length > 0) {
+        toast.success(`Processed ${newResults.length} log file(s)`, {
+          description:
+            `Found ${newResults.reduce((s: number, r: ParseResult) => s + (r?.totalCalls ?? 0), 0)} call end events` +
+            (duplicates > 0 ? ` · ${duplicates} duplicate file(s) skipped` : ''),
+        });
+      } else if (duplicates > 0) {
+        toast.info(`Skipped ${duplicates} duplicate file(s)`, {
+          description: 'These files are identical to logs already uploaded.',
+        });
+      }
     } catch (err: any) {
       console.error('Error parsing log files:', err);
       toast.error('Failed to parse log file(s)');
     } finally {
       setIsProcessing(false);
     }
-  }, []);
+  }, [results]);
 
   const handleClearAll = useCallback(() => {
     setResults([]);

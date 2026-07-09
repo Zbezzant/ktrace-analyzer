@@ -1,3 +1,5 @@
+import { contentHash } from '@/lib/utils';
+
 export interface LastSpeechInfo {
   text: string;
   timestamp: string;
@@ -26,6 +28,7 @@ export interface ParseResult {
   totalCalls: number;
   fileName: string;
   delay: DelayAnalysis;
+  contentHash: string;
 }
 
 /* =============================================================================
@@ -322,6 +325,7 @@ export function filteredDeltas(analysis: DelayAnalysis | null | undefined, cfg: 
  */
 export function parseKtraceLog(content: string, fileName: string): ParseResult {
   const lines = (content ?? '').split('\n');
+  const hash = contentHash(content ?? '');
 
   // ---- Regex patterns ----
   const plusKeyRegex = /^(\S+)\s+-\s+Agent Key Press - "\+"/;
@@ -567,6 +571,7 @@ export function parseKtraceLog(content: string, fileName: string): ParseResult {
     totalCalls: totalPlusKey + totalProtocallStop,
     fileName,
     delay: analyzeDelays(lines, fileName),
+    contentHash: hash,
   };
 }
 

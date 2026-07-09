@@ -52,7 +52,7 @@ interface DelayAnalysisProps {
 
 interface AgentRow {
   agent: string;
-  fileName: string;
+  fileCount: number;
   stat: DelayStat | null;
 }
 
@@ -91,17 +91,42 @@ export function DelayAnalysis({ results: externalResults }: DelayAnalysisProps) 
   const handleFileUpload = useCallback(async (files: File[]) => {
     setIsProcessing(true);
     try {
+      const existingHashes = new Set((internalResults ?? []).map((r) => r.contentHash));
+      const batchHashes = new Set<string>();
       const newResults: ParseResult[] = [];
+      let duplicateCount = 0;
+
       for (const file of files ?? []) {
         const content = await file?.text?.();
-        if (content) {
-          newResults.push(parseKtraceLog(content, file?.name ?? 'unknown'));
+        if (!content) continue;
+        const parsed = parseKtraceLog(content, file?.name ?? 'unknown');
+        if (existingHashes.has(parsed.contentHash) || batchHashes.has(parsed.contentHash)) {
+          duplicateCount += 1;
+          continue;
         }
+        batchHashes.add(parsed.contentHash);
+        newResults.push(parsed);
       }
+
+      if (newResults.length === 0) {
+        toast.info('Duplicate file(s) skipped', {
+          description:
+            duplicateCount > 0
+              ? `${duplicateCount} file(s) contained data identical to files already uploaded.`
+              : 'No readable log content found.',
+        });
+        return;
+      }
+
       setInternalResults((prev) => [...(prev ?? []), ...newResults]);
-      const supported = newResults.filter((r) => r?.delay?.hasSpeechStopped).length;
+      const supportedCount = newResults.filter((r) => r?.delay?.hasSpeechStopped).length;
       toast.success(`Processed ${newResults.length} log file(s)`, {
-        description: `${supported} VAD log(s) analyzed, ${newResults.length - supported} skipped (no SPEECH_STOPPED)`,
+        description: [
+          `${supportedCount} VAD log(s) analyzed, ${newResults.length - supportedCount} skipped (no SPEECH_STOPPED)`,
+          duplicateCount > 0 ? `${duplicateCount} duplicate(s) skipped` : null,
+        ]
+          .filter(Boolean)
+          .join(' · '),
       });
     } catch (err) {
       console.error('Error parsing log files for delay analysis:', err);
@@ -109,7 +134,7 @@ export function DelayAnalysis({ results: externalResults }: DelayAnalysisProps) 
     } finally {
       setIsProcessing(false);
     }
-  }, []);
+  }, [internalResults]);
 
   const handleClearAll = useCallback(() => {
     setInternalResults([]);
@@ -126,46 +151,52 @@ export function DelayAnalysis({ results: externalResults }: DelayAnalysisProps) 
     [results],
   );
 
-  // Apply thresholds LIVE — recompute whenever ceiling/floor change
-  const perFile = useMemo(
-    () =>
-      supported.map((r) => ({
-        agent: r.delay.agent,
-        fileName: r.fileName,
-        samples: (r.delay.rawSamples ?? []).filter(
-          (s) => s.delta >= config.floorMs && s.delta <= config.ceilingMs,
-        ),
-      })),
-    [supported, config.ceilingMs, config.floorMs],
-  );
+  // Apply thresholds LIVE — recompute whenever ceiling/floor change.
+  // Files that belong to the SAME agent are combined into a single entry so
+  // multiple uploads for one agent are treated as one dataset.
+  const perAgent = useMemo(() => {
+    const map = new Map<
+      string,
+      { agent: string; fileNames: string[]; samples: typeof supported[number]['delay']['rawSamples'] }
+    >();
+    for (const r of supported) {
+      const agent = r.delay.agent;
+      const samples = (r.delay.rawSamples ?? []).filter(
+        (s) => s.delta >= config.floorMs && s.delta <= config.ceilingMs,
+      );
+      if (!map.has(agent)) map.set(agent, { agent, fileNames: [], samples: [] });
+      const entry = map.get(agent)!;
+      entry.fileNames.push(r.fileName);
+      entry.samples.push(...samples);
+    }
+    return Array.from(map.values());
+  }, [supported, config.ceilingMs, config.floorMs]);
 
   // (A) Overall summary
   const overall = useMemo(() => {
-    const allDeltas = perFile.flatMap((f) => f.samples.map((s) => s.delta));
+    const allDeltas = perAgent.flatMap((f) => f.samples.map((s) => s.delta));
     const pages = new Set<string>();
-    const agents = new Set<string>();
-    perFile.forEach((f) => {
-      agents.add(f.agent);
+    perAgent.forEach((f) => {
       f.samples.forEach((s) => pages.add(s.page));
     });
     return {
       stat: summarizeDeltas(allDeltas),
-      nAgents: agents.size,
+      nAgents: perAgent.length,
       nPages: pages.size,
     };
-  }, [perFile]);
+  }, [perAgent]);
 
-  // (B) Overall agent comparison
+  // (B) Overall agent comparison (one row per agent, combining all their files)
   const agentRows: AgentRow[] = useMemo(() => {
-    const rows = perFile.map((f) => ({
+    const rows = perAgent.map((f) => ({
       agent: f.agent,
-      fileName: f.fileName,
+      fileCount: f.fileNames.length,
       stat: summarizeDeltas(f.samples.map((s) => s.delta)),
     }));
     return rows
       .filter((r) => r.stat)
       .sort((a, b) => (a.stat!.median - b.stat!.median));
-  }, [perFile]);
+  }, [perAgent]);
 
   const slowestMedian = useMemo(
     () => Math.max(1, ...agentRows.map((r) => r.stat?.median ?? 0)),
@@ -179,7 +210,7 @@ export function DelayAnalysis({ results: externalResults }: DelayAnalysisProps) 
     // page -> key -> agent -> KeyAgg
     const keyMap = new Map<string, Map<string, Map<string, KeyAgg>>>();
 
-    for (const f of perFile) {
+    for (const f of perAgent) {
       for (const s of f.samples) {
         // page -> agent -> deltas
         if (!pageAgent.has(s.page)) pageAgent.set(s.page, new Map());
@@ -249,7 +280,7 @@ export function DelayAnalysis({ results: externalResults }: DelayAnalysisProps) 
     }
 
     return sections.sort((a, b) => b.total - a.total);
-  }, [perFile]);
+  }, [perAgent]);
 
   const hasData = (results?.length ?? 0) > 0;
   const hasSupported = supported.length > 0;
@@ -474,6 +505,11 @@ export function DelayAnalysis({ results: externalResults }: DelayAnalysisProps) 
                         {i === 0 && (
                           <span className="ml-2 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
                             FASTEST
+                          </span>
+                        )}
+                        {r.fileCount > 1 && (
+                          <span className="ml-2 text-[10px] font-medium px-1.5 py-0.5 rounded bg-primary/10 text-primary">
+                            {r.fileCount} files combined
                           </span>
                         )}
                       </td>
